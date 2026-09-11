@@ -19,21 +19,21 @@ class SO101PickPlaceEnv(gym.Env):
 
         self.render_mode = render_mode
 
-        xml_path = os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "assets",
-            "scene.xml",
+        xml_path = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "assets",
+                "scene.xml",
+            )
         )
-
-        xml_path = os.path.abspath(xml_path)
 
         self.model = mujoco.MjModel.from_xml_path(xml_path)
         self.data = mujoco.MjData(self.model)
 
-        # --------------------------------------------------
-        # Joint IDs
-        # --------------------------------------------------
+        # ==================================================
+        # JOINTS
+        # ==================================================
 
         self.joint_names = [
             "Shoulder_Rotation",
@@ -53,9 +53,9 @@ class SO101PickPlaceEnv(gym.Env):
             for name in self.joint_names
         ]
 
-        # --------------------------------------------------
-        # Actuator IDs
-        # --------------------------------------------------
+        # ==================================================
+        # ACTUATORS
+        # ==================================================
 
         self.actuator_ids = [
             mujoco.mj_name2id(
@@ -66,9 +66,25 @@ class SO101PickPlaceEnv(gym.Env):
             for name in self.joint_names
         ]
 
-        # --------------------------------------------------
-        # Cube
-        # --------------------------------------------------
+        # ==================================================
+        # ROBOT BODIES
+        # ==================================================
+
+        self.ee_body_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            "Fixed_Jaw",
+        )
+
+        self.moving_jaw_body_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            "Moving_Jaw",
+        )
+
+        # ==================================================
+        # CUBE
+        # ==================================================
 
         self.cube_body_id = mujoco.mj_name2id(
             self.model,
@@ -79,26 +95,28 @@ class SO101PickPlaceEnv(gym.Env):
         self.cube_joint_id = mujoco.mj_name2id(
             self.model,
             mujoco.mjtObj.mjOBJ_JOINT,
-            "freejoint",
+            "cube_freejoint",
         )
 
-        # --------------------------------------------------
-        # End effector
-        # --------------------------------------------------
-
-        self.ee_body_id = mujoco.mj_name2id(
+        self.cube_geom_id = mujoco.mj_name2id(
             self.model,
-            mujoco.mjtObj.mjOBJ_BODY,
-            "Fixed_Jaw",
+            mujoco.mjtObj.mjOBJ_GEOM,
+            "cube_geom",
         )
 
-        # --------------------------------------------------
-        # Action
-        #
-        # 5 arm joints + gripper
-        #
-        # [-1,1]
-        # --------------------------------------------------
+        # ==================================================
+        # BOWL
+        # ==================================================
+        
+        self.bowl_joint_id = mujoco.mj_name2id(
+        self.model,
+        mujoco.mjtObj.mjOBJ_JOINT,
+        "bowl_freejoint",
+        )
+        
+        # ==================================================
+        # ACTION
+        # ==================================================
 
         self.action_space = spaces.Box(
             low=-1.0,
@@ -107,17 +125,9 @@ class SO101PickPlaceEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # --------------------------------------------------
-        # Observation
-        #
-        # qpos          6
-        # qvel          6
-        # ee position   3
-        # cube position 3
-        # target        3
-        # cube -> ee    3
-        # cube -> goal  3
-        # --------------------------------------------------
+        # ==================================================
+        # OBSERVATION
+        # ==================================================
 
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -126,7 +136,6 @@ class SO101PickPlaceEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Maximum joint change per environment step
         self.max_joint_delta = np.array([
             0.08,
             0.08,
@@ -136,14 +145,13 @@ class SO101PickPlaceEnv(gym.Env):
             0.10,
         ])
 
-        self.target = np.array([
-            0.15,
-            -0.20,
-            0.41,
-        ])
-
-        self.max_episode_steps = 300
+        self.max_episode_steps = 1000
         self.step_count = 0
+
+        self.target = np.zeros(3)
+
+        self.grasped = False
+        self.was_lifted = False
 
         self.viewer = None
 
@@ -155,13 +163,14 @@ class SO101PickPlaceEnv(gym.Env):
 
         super().reset(seed=seed)
 
-        mujoco.mj_resetData(self.model, self.data)
+        mujoco.mj_resetData(
+            self.model,
+            self.data,
+        )
 
         # --------------------------------------------------
         # Robot home
         # --------------------------------------------------
-
-        self.data.qpos[:] = 0
 
         home = {
             "Shoulder_Rotation": 0.0,
@@ -180,53 +189,92 @@ class SO101PickPlaceEnv(gym.Env):
                 name,
             )
 
-            qpos_addr = self.model.jnt_qposadr[joint_id]
+            qpos_addr = self.model.jnt_qposadr[
+                joint_id
+            ]
 
             self.data.qpos[qpos_addr] = value
 
         # --------------------------------------------------
         # Random cube
         # --------------------------------------------------
+        MIN_SEPERATION = 0.16
+        while True:
+            cube_x = self.np_random.uniform(
+                0.18,
+                0.32,
+            )
 
-        cube_x = self.np_random.uniform(
-            0.18,
-            0.32,
-        )
-
-        cube_y = self.np_random.uniform(
-            -0.18,
-            0.18,
-        )
-
+            cube_y = self.np_random.uniform(
+                -0.18,
+                0.18,
+            )
+            
+            self.target = np.array([
+            self.np_random.uniform(
+                0.18,
+                0.30,
+            ),
+            self.np_random.uniform(
+                -0.20,
+                0.20,
+            ),
+            0.41,
+            ])
+            
+            separation = np.linalg.norm(
+                np.array([cube_x, cube_y])
+                - self.target[:2]
+            )
+            
+            if separation >= MIN_SEPERATION:
+                break
+            
         cube_z = 0.39
 
         cube_qpos = self.model.jnt_qposadr[
             self.cube_joint_id
         ]
 
-        self.data.qpos[cube_qpos:cube_qpos + 3] = [
+        self.data.qpos[
+            cube_qpos:cube_qpos + 3
+        ] = [
             cube_x,
             cube_y,
             cube_z,
         ]
 
-        # Free joint quaternion
-        self.data.qpos[cube_qpos + 3:cube_qpos + 7] = [
-            1,
+        yaw = self.np_random.uniform(
+            -np.pi,
+            np.pi,
+        )
+
+        self.data.qpos[
+            cube_qpos + 3:cube_qpos + 7
+        ] = [
+            np.cos(yaw / 2),
             0,
             0,
-            0,
+            np.sin(yaw / 2),
         ]
 
         # --------------------------------------------------
-        # Random target
+        # Random bowl position
         # --------------------------------------------------
 
-        self.target = np.array([
-            self.np_random.uniform(0.10, 0.30),
-            self.np_random.uniform(-0.20, 0.20),
-            0.41,
-        ])
+
+        bowl_qpos = self.model.jnt_qposadr[
+             self.bowl_joint_id
+        ]
+        self.data.qpos[bowl_qpos:bowl_qpos + 3] = self.target
+        yaw = self.np_random.uniform(-np.pi, np.pi)
+
+        self.data.qpos[bowl_qpos + 3:bowl_qpos + 7] = [
+            np.cos(yaw / 2),
+            0.0,
+            0.0,
+            np.sin(yaw / 2),
+        ]
 
         mujoco.mj_forward(
             self.model,
@@ -234,10 +282,10 @@ class SO101PickPlaceEnv(gym.Env):
         )
 
         self.step_count = 0
+        self.grasped = False
+        self.was_lifted = False
 
-        observation = self._get_obs()
-
-        return observation, {}
+        return self._get_obs(), {}
 
     # ======================================================
     # OBSERVATION
@@ -267,11 +315,15 @@ class SO101PickPlaceEnv(gym.Env):
             self.cube_body_id
         ].copy()
 
-        cube_to_ee = cube_pos - ee_pos
+        cube_to_ee = (
+            cube_pos - ee_pos
+        )
 
-        cube_to_target = self.target - cube_pos
+        cube_to_target = (
+            self.target - cube_pos
+        )
 
-        obs = np.concatenate([
+        return np.concatenate([
             qpos,
             qvel,
             ee_pos,
@@ -279,9 +331,83 @@ class SO101PickPlaceEnv(gym.Env):
             self.target,
             cube_to_ee,
             cube_to_target,
-        ])
+        ]).astype(np.float32)
 
-        return obs.astype(np.float32)
+    # ======================================================
+    # GRASP DETECTION
+    # ======================================================
+
+    def _check_grasp(self):
+
+        cube_pos = self.data.xpos[
+            self.cube_body_id
+        ]
+
+        fixed_pos = self.data.xpos[
+            self.ee_body_id
+        ]
+
+        moving_pos = self.data.xpos[
+            self.moving_jaw_body_id
+        ]
+
+        fixed_distance = np.linalg.norm(
+            cube_pos - fixed_pos
+        )
+
+        moving_distance = np.linalg.norm(
+            cube_pos - moving_pos
+        )
+
+        gripper_joint = self.data.qpos[
+            self.model.jnt_qposadr[
+                self.joint_ids[5]
+            ]
+        ]
+
+        # Cube must be close to both jaws
+        # and gripper must be reasonably closed.
+
+        return (
+            fixed_distance < 0.045
+            and moving_distance < 0.045
+            and gripper_joint < 0.45
+        )
+
+    # ======================================================
+    # CHECK PLACEMENT
+    # ======================================================
+
+    def _check_success(self):
+
+        cube_pos = self.data.xpos[
+            self.cube_body_id
+        ]
+
+        horizontal_distance = np.linalg.norm(
+            cube_pos[:2] -
+            self.target[:2]
+        )
+
+        # Cube must be inside the bowl
+        # and sitting approximately at the
+        # bowl bottom.
+
+        return (
+            horizontal_distance < 0.045
+            and cube_pos[2] < 0.45
+            and not self.grasped
+        )
+    # ======================================================
+    #  CHECK TABLE COLLISION
+    # ======================================================
+    
+    def _check_table_collision(self):
+
+        TABLE_Z_LIMIT = 0.40
+        ee_z = self.data.xpos[self.ee_body_id][2]
+
+        return ee_z < TABLE_Z_LIMIT
 
     # ======================================================
     # STEP
@@ -289,15 +415,10 @@ class SO101PickPlaceEnv(gym.Env):
 
     def step(self, action):
 
-        action = np.asarray(
-            action,
-            dtype=np.float64,
-        )
-
         action = np.clip(
             action,
-            -1,
-            1,
+            -1.0,
+            1.0,
         )
 
         # --------------------------------------------------
@@ -324,21 +445,16 @@ class SO101PickPlaceEnv(gym.Env):
                 * self.max_joint_delta[i]
             )
 
-            # Respect MuJoCo joint limits
-            lower = self.model.jnt_range[
-                joint_id,
-                0,
-            ]
-
-            upper = self.model.jnt_range[
-                joint_id,
-                1,
-            ]
-
             target = np.clip(
                 target,
-                lower,
-                upper,
+                self.model.jnt_range[
+                    joint_id,
+                    0,
+                ],
+                self.model.jnt_range[
+                    joint_id,
+                    1,
+                ],
             )
 
             self.data.ctrl[
@@ -346,7 +462,7 @@ class SO101PickPlaceEnv(gym.Env):
             ] = target
 
         # --------------------------------------------------
-        # Simulate
+        # Simulation
         # --------------------------------------------------
 
         for _ in range(5):
@@ -359,7 +475,7 @@ class SO101PickPlaceEnv(gym.Env):
         self.step_count += 1
 
         # --------------------------------------------------
-        # Reward
+        # State
         # --------------------------------------------------
 
         ee_pos = self.data.xpos[
@@ -370,59 +486,131 @@ class SO101PickPlaceEnv(gym.Env):
             self.cube_body_id
         ]
 
-        ee_cube_distance = np.linalg.norm(
+        distance_to_cube = np.linalg.norm(
             ee_pos - cube_pos
         )
 
-        cube_target_distance = np.linalg.norm(
-            cube_pos - self.target
+        distance_to_target = np.linalg.norm(
+            cube_pos[:2] -
+            self.target[:2]
         )
-
         reward = 0.0
 
+        # --------------------------------------------------
+        # Grasp
+        # --------------------------------------------------
+
+        if not self.grasped:
+
+            if self._check_grasp():
+
+                self.grasped = True
+                reward +=20
+
+        # --------------------------------------------------
+        # Lift
+        # --------------------------------------------------
+
+        if self.grasped:
+
+            if cube_pos[2] > 0.44:
+
+                self.was_lifted = True
+
+        # --------------------------------------------------
+        # Reward
+        # --------------------------------------------------
+
+        
+        table_collision = self._check_table_collision()
+        
+        if table_collision:
+            reward -= 5.0
+
         # Reach cube
-        reward += -2.0 * ee_cube_distance
+        reward += -2.0 * distance_to_cube
+        # grasp shaping
+        
+        fixed_pos = self.data.xpos[self.ee_body_id]
+        moving_pos = self.data.xpos[self.moving_jaw_body_id]
+        
+        gripper_joint = self.data.qpos[
+            self.model.jnt_qposadr[self.joint_ids[5]]
+        ]
+        
+        jaw_midpoint = 0.5 * (
+            fixed_pos + moving_pos
+        )
+        cube_to_midpoint = np.linalg.norm(
+            cube_pos - jaw_midpoint
+        )
+        jaw_distance = np.linalg.norm(
+            fixed_pos - moving_pos
+        )
+        desired_jaw_distance = 0.045
 
-        # Move cube toward target
-        reward += -2.0 * cube_target_distance
+        if distance_to_cube < 0.10:
 
-        # Encourage lifting
-        if cube_pos[2] > 0.42:
+        # Get the cube into the middle of the gripper
+            reward += -3.0 * cube_to_midpoint
+
+            # Encourage the jaws to reach a graspable width
+            reward += -2.0 * abs(
+            jaw_distance - desired_jaw_distance
+            )
+             # Only encourage closing once the cube is
+             # reasonably centered between the jaws.
+             
+            if cube_to_midpoint < 0.035:
+
+                close_progress = np.clip(
+                    (0.45 - gripper_joint) / 0.45,
+                    0.0,
+                    1.0,
+                )
+                reward += 2.0 * close_progress
+
+
+        # Once grasped, reward transporting cube
+        if self.grasped:
+
+            reward += -3.0 * distance_to_target
+
+        # Reward lifting
+        if self.was_lifted:
 
             reward += 2.0
 
         # Successful placement
-        success = (
-            cube_target_distance < 0.04
-            and cube_pos[2] > 0.40
-        )
+        success = self._check_success()
 
-        if success:
+        if success and self.was_lifted:
 
             reward += 100.0
 
-        # Small action penalty
+        # Action regularization
         reward -= 0.001 * np.sum(
             action ** 2
         )
 
-        terminated = success
+        terminated = success and self.was_lifted
 
         truncated = (
             self.step_count
             >= self.max_episode_steps
         )
 
-        observation = self._get_obs()
-
         info = {
-            "success": success,
-            "ee_cube_distance": ee_cube_distance,
-            "cube_target_distance": cube_target_distance,
+            "success": bool(terminated),
+            "grasped": bool(self.grasped),
+            "lifted": bool(self.was_lifted),
+            "cube_target_distance": float(
+                distance_to_target
+            ),
         }
 
         return (
-            observation,
+            self._get_obs(),
             float(reward),
             terminated,
             truncated,
